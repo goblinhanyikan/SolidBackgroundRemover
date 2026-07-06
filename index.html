@@ -65,7 +65,7 @@
 <body>
 
 <h1>Offline Background Remover</h1>
-<p class="sub">Runs entirely in your browser — no upload, no internet needed. Works best on photos with a fairly solid or uniform background. Click a spot on the background in the original image to pick which color to remove.</p>
+<p class="sub">Runs entirely in your browser — no upload, no internet needed. Optimized for logos/objects on a solid background: it flood-fills the background from the image edges (so it won't touch similar colors inside the object), fills enclosed holes like the inside of an "O", cleans up edge fringing, and can strip lingering off-target color anywhere in the image (e.g. faint white specks) with the purity slider.</p>
 
 <div class="panel">
   <div class="drop" id="drop">
@@ -75,12 +75,22 @@
 
   <div class="row" id="controls" style="display:none; margin-top:16px;">
     <div>
-      <label>Tolerance: <span class="val" id="tolVal">40</span></label><br>
-      <input type="range" id="tolerance" min="0" max="150" value="40">
+      <label>Match tolerance: <span class="val" id="tolVal">32</span></label><br>
+      <input type="range" id="tolerance" min="1" max="120" value="32">
     </div>
     <div>
-      <label>Edge feather: <span class="val" id="featherVal">2</span></label><br>
-      <input type="range" id="feather" min="0" max="10" value="2">
+      <label>Edge cleanup (px): <span class="val" id="featherVal">3</span></label><br>
+      <input type="range" id="feather" min="0" max="8" value="3">
+    </div>
+    <div>
+      <label>Purity strip: <span class="val" id="purityVal">0</span></label><br>
+      <input type="range" id="purity" min="0" max="400" value="0">
+    </div>
+    <div>
+      <label style="display:flex; align-items:center; gap:6px;">
+        <input type="checkbox" id="fillHoles" checked style="width:auto;">
+        Fill enclosed holes (O, A, etc.)
+      </label>
     </div>
     <div>
       <label>Picked color<span id="colorSwatch"></span></label>
@@ -113,6 +123,7 @@ const tolerance = document.getElementById('tolerance');
 const feather = document.getElementById('feather');
 const tolVal = document.getElementById('tolVal');
 const featherVal = document.getElementById('featherVal');
+const purityVal = document.getElementById('purityVal');
 const downloadBtn = document.getElementById('downloadBtn');
 const resetColor = document.getElementById('resetColor');
 const colorSwatch = document.getElementById('colorSwatch');
@@ -177,37 +188,213 @@ srcCanvas.addEventListener('click', (e) => {
   process();
 });
 
+function colorDist(r,g,b,pr,pg,pb){
+  return Math.sqrt((r-pr)*(r-pr) + (g-pg)*(g-pg) + (b-pb)*(b-pb));
+}
+
+// Flood fill from the four borders: marks pixels connected to the edge
+// that match the background color within tolerance. This avoids nuking
+// similarly-colored details INSIDE the logo, since they aren't connected
+// to the border.
+function floodFillFromBorder(data, w, h, bg, tol){
+  const mask = new Uint8Array(w*h); // 1 = background
+  const visited = new Uint8Array(w*h);
+  const stack = new Int32Array(w*h);
+  let sp = 0;
+
+  function tryPush(x, y){
+    if(x<0||x>=w||y<0||y>=h) return;
+    const idx = y*w+x;
+    if(visited[idx]) return;
+    visited[idx] = 1;
+    const i = idx*4;
+    const d = colorDist(data[i], data[i+1], data[i+2], bg.r, bg.g, bg.b);
+    if(d < tol){
+      mask[idx] = 1;
+      stack[sp++] = idx;
+    }
+  }
+
+  for(let x=0; x<w; x++){ tryPush(x,0); tryPush(x,h-1); }
+  for(let y=0; y<h; y++){ tryPush(0,y); tryPush(w-1,y); }
+
+  while(sp > 0){
+    const idx = stack[--sp];
+    const x = idx % w, y = (idx / w) | 0;
+    tryPush(x+1,y); tryPush(x-1,y); tryPush(x,y+1); tryPush(x,y-1);
+  }
+  return mask;
+}
+
+// Finds small enclosed regions (not touching border) that still match the
+// background color -- e.g. the hole inside an "O" or "A" -- and adds them
+// to the mask, as long as they're small relative to the image (guards
+// against accidentally eating large same-colored logo areas).
+function fillEnclosedHoles(data, w, h, bg, tol, mask){
+  const total = w*h;
+  const visited = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  const maxHoleSize = total * 0.15;
+
+  for(let start=0; start<total; start++){
+    if(mask[start] || visited[start]) continue;
+    const i = start*4;
+    const d = colorDist(data[i], data[i+1], data[i+2], bg.r, bg.g, bg.b);
+    if(d >= tol) { visited[start] = 1; continue; }
+
+    // flood fill this candidate region
+    let sp = 0;
+    stack[sp++] = start;
+    visited[start] = 1;
+    const region = [start];
+    let touchesBg = false;
+
+    while(sp > 0){
+      const idx = stack[--sp];
+      const x = idx % w, y = (idx / w) | 0;
+      const neighbors = [[x+1,y],[x-1,y],[x,y+1],[x,y-1]];
+      for(const [nx,ny] of neighbors){
+        if(nx<0||nx>=w||ny<0||ny>=h) continue;
+        const nIdx = ny*w+nx;
+        if(mask[nIdx]) { touchesBg = true; continue; }
+        if(visited[nIdx]) continue;
+        visited[nIdx] = 1;
+        const ni = nIdx*4;
+        const nd = colorDist(data[ni], data[ni+1], data[ni+2], bg.r, bg.g, bg.b);
+        if(nd < tol){
+          stack[sp++] = nIdx;
+          region.push(nIdx);
+        }
+      }
+      if(region.length > maxHoleSize) break;
+    }
+    if(region.length <= maxHoleSize){
+      for(const idx of region) mask[idx] = 1;
+    }
+  }
+}
+
+// Multi-source BFS distance transform from mask pixels outward, capped at maxDist.
+function distanceFromMask(mask, w, h, maxDist){
+  const total = w*h;
+  const dist = new Int16Array(total).fill(-1);
+  const queue = new Int32Array(total);
+  let qHead = 0, qTail = 0;
+  for(let i=0; i<total; i++){
+    if(mask[i]){ dist[i] = 0; queue[qTail++] = i; }
+  }
+  while(qHead < qTail){
+    const idx = queue[qHead++];
+    const d = dist[idx];
+    if(d >= maxDist) continue;
+    const x = idx % w, y = (idx / w) | 0;
+    const neighbors = [[x+1,y],[x-1,y],[x,y+1],[x,y-1]];
+    for(const [nx,ny] of neighbors){
+      if(nx<0||nx>=w||ny<0||ny>=h) continue;
+      const nIdx = ny*w+nx;
+      if(dist[nIdx] === -1){
+        dist[nIdx] = d+1;
+        queue[qTail++] = nIdx;
+      }
+    }
+  }
+  return dist;
+}
+
 function process(){
   if(!imgData || !pickedColor) return;
   const w = imgData.width, h = imgData.height;
   const src = imgData.data;
-  const out = outCtx.createImageData(w, h);
-  const od = out.data;
   const tol = parseInt(tolerance.value, 10);
   const feat = parseInt(feather.value, 10);
+  const bg = pickedColor;
 
-  const {r:pr, g:pg, b:pb} = pickedColor;
+  let mask = floodFillFromBorder(src, w, h, bg, tol);
+  if(document.getElementById('fillHoles').checked){
+    fillEnclosedHoles(src, w, h, bg, tol, mask);
+  }
 
-  for(let i=0; i<src.length; i+=4){
-    const r=src[i], g=src[i+1], b=src[i+2], a=src[i+3];
-    const dist = Math.sqrt((r-pr)**2 + (g-pg)**2 + (b-pb)**2);
-    od[i]=r; od[i+1]=g; od[i+2]=b;
-    if(dist < tol){
-      od[i+3] = 0;
-    } else if(feat > 0 && dist < tol + feat*15){
-      // feather the edge for a softer cutout
-      const t = (dist - tol) / (feat*15);
-      od[i+3] = Math.round(a * Math.min(1, Math.max(0,t)));
-    } else {
-      od[i+3] = a;
+  const out = outCtx.createImageData(w, h);
+  const od = out.data;
+
+  if(feat === 0){
+    // hard cutout, no decontamination
+    for(let p=0; p<w*h; p++){
+      const i = p*4;
+      od[i]=src[i]; od[i+1]=src[i+1]; od[i+2]=src[i+2];
+      od[i+3] = mask[p] ? 0 : src[i+3];
+    }
+  } else {
+    const dist = distanceFromMask(mask, w, h, feat);
+    for(let p=0; p<w*h; p++){
+      const i = p*4;
+      const r=src[i], g=src[i+1], b=src[i+2], a=src[i+3];
+      if(mask[p]){
+        od[i]=r; od[i+1]=g; od[i+2]=b; od[i+3]=0;
+        continue;
+      }
+      const d = dist[p];
+      if(d === -1 || d > feat){
+        // far from any background edge, leave untouched
+        od[i]=r; od[i+1]=g; od[i+2]=b; od[i+3]=a;
+      } else {
+        // in the boundary band: compute alpha from color proximity to bg,
+        // then decontaminate the color to strip out blended background tint
+        const cDist = colorDist(r,g,b,bg.r,bg.g,bg.b);
+        let alpha = Math.min(1, cDist / tol);
+        if(alpha < 0.04) alpha = 0;
+        if(alpha <= 0){
+          od[i]=r; od[i+1]=g; od[i+2]=b; od[i+3]=0;
+        } else {
+          const nr = (r - (1-alpha)*bg.r) / alpha;
+          const ng = (g - (1-alpha)*bg.g) / alpha;
+          const nb = (b - (1-alpha)*bg.b) / alpha;
+          od[i]   = Math.max(0, Math.min(255, nr));
+          od[i+1] = Math.max(0, Math.min(255, ng));
+          od[i+2] = Math.max(0, Math.min(255, nb));
+          od[i+3] = Math.round(a * alpha);
+        }
+      }
     }
   }
+
+  const purityTol = parseInt(document.getElementById('purity').value, 10);
+  if(purityTol > 0){
+    for(let p=0; p<w*h; p++){
+      const i = p*4;
+      if(od[i+3] === 0) continue; // already fully transparent
+      const r=src[i], g=src[i+1], b=src[i+2];
+      const cDist = colorDist(r,g,b,bg.r,bg.g,bg.b);
+      if(cDist >= purityTol) continue; // not close enough to target color
+      let alpha = Math.min(1, cDist / purityTol);
+      alpha = Math.pow(alpha, 1.8); // steeper curve: more aggressive removal, will eat into faint/light logo detail if pushed high
+      if(alpha < 0.04) alpha = 0;
+      const existingAlphaFrac = od[i+3] / 255;
+      if(alpha <= 0){
+        od[i+3] = 0;
+      } else {
+        const nr = (r - (1-alpha)*bg.r) / alpha;
+        const ng = (g - (1-alpha)*bg.g) / alpha;
+        const nb = (b - (1-alpha)*bg.b) / alpha;
+        od[i]   = Math.max(0, Math.min(255, nr));
+        od[i+1] = Math.max(0, Math.min(255, ng));
+        od[i+2] = Math.max(0, Math.min(255, nb));
+        od[i+3] = Math.round(255 * existingAlphaFrac * alpha);
+      }
+    }
+  }
+
   outCtx.putImageData(out, 0, 0);
   downloadBtn.disabled = false;
 }
 
 tolerance.addEventListener('input', () => { tolVal.textContent = tolerance.value; process(); });
 feather.addEventListener('input', () => { featherVal.textContent = feather.value; process(); });
+document.getElementById('purity').addEventListener('input', () => {
+  purityVal.textContent = document.getElementById('purity').value;
+  process();
+});
+document.getElementById('fillHoles').addEventListener('change', process);
 
 resetColor.addEventListener('click', () => {
   if(imgData){
